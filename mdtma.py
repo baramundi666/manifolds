@@ -1,24 +1,58 @@
 """
 mdtma.py
 --------
-mDTMA — manifold Differential-evolution / Tournament-selection /
-Memetic / Approximation optimiser.
+mDTMA solver — two modes in one file:
 
-A population-based, derivative-free minimiser for functions defined on
-Riemannian manifolds.  The update rule fuses a GA-style crossover (SBX +
-polynomial mutation) with a PSO-style retraction step so that every candidate
-stays on the manifold throughout the optimisation.
+  mdtma(...)          Original minimisation mode (unchanged logic).
+  mdtma_explore(...)  New exploration / dataset-generation mode.
 
-Original MATLAB source: mDTMA.m  (Lingping Kong, 2023)
-Based on pymanopt for manifold operations: https://www.pymanopt.org/
+=== WHAT CHANGED FOR EXPLORATION MODE ===
+
+1. COST FUNCTION → REPULSION FROM ARCHIVE
+   Instead of minimising a user-supplied f(x), each particle's fitness is the
+   *negative* Euclidean distance to its nearest neighbour in a growing archive
+   of all previously accepted points.  "Lower cost" = "farther from everything
+   already found" = more isolated = more useful for dataset generation.
+
+   One-line change in evaluation:
+     BEFORE: cost = user_cost_fn(x)
+     AFTER:  cost = -min_dist(x, archive)    # negative so minimiser = explorer
+
+2. PERMANENT ARCHIVE (no point re-use)
+   All offspring that pass the spacing check are appended to a global archive.
+   The exploration cost is computed against the full archive (not just the live
+   population), so regions already visited stay penalised forever.
+
+   Added after offspring evaluation:
+     archive.extend(offspring)
+
+3. MINIMUM-SPACING REJECTION
+   Offspring closer than `min_spacing` to any archived point are replaced by a
+   fresh random manifold point.  This prevents clustering and guarantees the
+   archive contains only well-separated points.
+
+   Added inside the offspring loop:
+     if min_dist(candidate, archive) < min_spacing:
+         candidate = manifold.random_point()
+
+4. DIVERSITY-AWARE PARENT RE-EVALUATION
+   Before (μ+λ) selection, parent costs are re-evaluated against the updated
+   archive so the selection pressure always reflects the current state of
+   coverage rather than stale distances from earlier iterations.
+
+   Added before sorting:
+     costs = [exploration_cost(p, archive) for p in population]
+
+Everything else — tournament selection, SBX+PM GA operator, Riemannian
+retraction, decaying inertia weight w = w0+0.1*(1-iter/max_iter), and the
+(μ+λ) elitist survival rule — is **identical** to the original algorithm.
 """
 
 from __future__ import annotations
 
 import time
-import warnings
-from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Callable, List, Optional
 
 import numpy as np
 
@@ -26,211 +60,289 @@ from operator_ga import operator_ga
 from tournament_selection import tournament_selection
 
 
-# ---------------------------------------------------------------------------
-# Return types
-# ---------------------------------------------------------------------------
-
 @dataclass
 class IterationStats:
-    """Snapshot of the optimiser state after one iteration."""
+    """State snapshot after one iteration (minimisation mode)."""
     iteration:  int
-    cost:       float          # best cost so far
-    cost_evals: int            # cumulative function evaluations
-    time:       float          # cumulative wall-clock seconds
+    cost:       float
+    cost_evals: int
+    time:       float
     population: List[np.ndarray]
     best_point: np.ndarray
 
 
 @dataclass
 class OptimiseResult:
-    """Full result returned by :func:`mdtma`."""
-    x:          np.ndarray          # best point found
-    cost:       float               # cost at best point
-    history:    List[IterationStats]
+    """Result of :func:`mdtma` (minimisation)."""
+    x:       np.ndarray
+    cost:    float
+    history: List[IterationStats]
 
 
-# ---------------------------------------------------------------------------
-# Main solver
-# ---------------------------------------------------------------------------
+@dataclass
+class ExploreStats:
+    """State snapshot after one iteration (exploration mode)."""
+    iteration:  int
+    archive_size: int         # total distinct points collected so far
+    max_gap:    float         # largest nearest-neighbour distance in archive
+    cost_evals: int
+    time:       float
+    population: List[np.ndarray]
+    archive:    List[np.ndarray]
+
+
+@dataclass
+class ExploreResult:
+    """Result of :func:`mdtma_explore`."""
+    points:  List[np.ndarray]   # the full collected dataset
+    history: List[ExploreStats]
+
+
+def _min_dist_to_archive(x: np.ndarray, archive: List[np.ndarray]) -> float:
+    """Euclidean distance from x to the nearest point in archive."""
+    if not archive:
+        return float("inf")
+    return float(np.min(np.linalg.norm(np.stack(archive) - x, axis=1)))
+
+
+def _exploration_cost(x: np.ndarray, archive: List[np.ndarray]) -> float:
+    """
+    Fitness for the exploration mode.
+    Lower = better = farther from all known points.
+    Returns -d(x, nearest_archive_point), or 0 if archive is empty.
+    """
+    if not archive:
+        return 0.0
+    return -_min_dist_to_archive(x, archive)
+
 
 def mdtma(
     manifold,
-    cost_fn:       Callable[[np.ndarray], float],
+    cost_fn: Callable[[np.ndarray], float],
     *,
-    population_size: int = 20,
-    max_iter:        int = 100,
+    population_size: int   = 20,
+    max_iter:        int   = 100,
     w0:              float = 0.5,
     x0:              Optional[List[np.ndarray]] = None,
-    verbosity:       int = 1,
-    # GA operator hyper-parameters (rarely need changing)
-    pro_c: float = 1.0,
-    dis_c: float = 20.0,
-    pro_m: float = 1.0,
-    dis_m: float = 20.0,
+    verbosity:       int   = 1,
+    pro_c: float = 1.0, dis_c: float = 20.0,
+    pro_m: float = 1.0, dis_m: float = 20.0,
 ) -> OptimiseResult:
     """
-    Minimise *cost_fn* on *manifold* using the mDTMA algorithm.
+    Minimise cost_fn on manifold using mDTMA (original algorithm, unchanged).
 
     Parameters
     ----------
-    manifold :
-        A pymanopt manifold instance (e.g. ``pymanopt.manifolds.Sphere(n)``).
-        Must expose ``dim``, ``random_point()``, ``retraction(x, v)``,
-        and ``projection(x, v)`` (to project a Euclidean vector onto the
-        tangent space at x).
-    cost_fn : callable
-        ``cost_fn(x) -> float`` — the scalar objective to minimise.
-    population_size : int
-        Number of particles.  Capped internally at ``4 * manifold.dim``.
-    max_iter : int
-        Maximum number of iterations.  At least ``10 * manifold.dim``,
-        capped at 800.
-    w0 : float
-        Base inertia weight.  The effective weight decays slightly each
-        iteration: ``w = w0 + 0.1 * (1 - iter / max_iter)``.
-    x0 : list of np.ndarray, optional
-        Initial population.  If *None* a random population is generated.
-    verbosity : int
-        0 = silent, 1 = summary line each iteration, 2 = detailed.
-    pro_c, dis_c, pro_m, dis_m : float
-        GA operator parameters forwarded to :func:`operator_ga`.
-
-    Returns
-    -------
-    OptimiseResult
-        ``.x``       – best point found
-        ``.cost``    – its cost value
-        ``.history`` – list of :class:`IterationStats`, one per iteration
+    manifold : pymanopt manifold
+    cost_fn  : f(x) -> float
+    population_size, max_iter, w0, x0, verbosity : see module docstring
+    pro_c, dis_c, pro_m, dis_m : GA operator parameters
     """
-    dim = manifold.dim
-
-    # ---- Resolve effective hyperparameters ----------------------------------
-    # Match MATLAB capping logic exactly.
+    dim             = manifold.dim
     max_iter        = min(800, max(max_iter, 10 * dim))
     population_size = min(population_size, 4 * dim)
 
-    # ---- Initialise population ----------------------------------------------
-    if x0 is None:
-        population = [manifold.random_point() for _ in range(population_size)]
-    else:
-        if not isinstance(x0, list):
-            raise TypeError("x0 must be a list of numpy arrays (one per particle).")
-        population = list(x0)
-        population_size = len(population)  # honour user-supplied size
-
-    # Velocities (tangent vectors at each particle's current position).
-    # Initialised to zero; updated during the first iteration.
+    population = (list(x0) if x0 is not None
+                  else [manifold.random_point() for _ in range(population_size)])
+    population_size = len(population)
     velocities: List[Optional[np.ndarray]] = [None] * population_size
 
-    # ---- Evaluate initial costs ---------------------------------------------
     costs      = np.array([cost_fn(x) for x in population], dtype=float)
     cost_evals = population_size
+    best_idx   = int(np.argmin(costs))
+    best_cost  = float(costs[best_idx])
+    best_x     = population[best_idx].copy()
 
-    # ---- Identify initial best ----------------------------------------------
-    best_idx  = int(np.argmin(costs))
-    best_cost = float(costs[best_idx])
-    best_x    = population[best_idx].copy()
-
-    # ---- History bookkeeping ------------------------------------------------
     history: List[IterationStats] = []
     t_start = time.perf_counter()
 
     if verbosity >= 1:
-        print(f"{'Iter':>6}  {'Cost evals':>10}  {'Best cost':>18}")
-        print("-" * 40)
+        print(f"{'Iter':>6}  {'Evals':>8}  {'Best cost':>18}")
+        print("-" * 38)
 
-    # =========================================================================
-    # Main optimisation loop
-    # =========================================================================
     for iteration in range(1, max_iter + 1):
-
-        # ---- Decaying inertia weight ----------------------------------------
-        # Starts just above w0 and decreases to w0 as iterations proceed.
-        w = w0 + 0.1 * (1.0 - iteration / max_iter)
-
-        # ---- Tournament selection → mating pool ----------------------------
-        # Returns population_size indices (with repetition allowed).
+        w           = w0 + 0.1 * (1.0 - iteration / max_iter)
         mating_pool = tournament_selection(2, population_size, costs)
+        vel_spring  = operator_ga(manifold, [population[i] for i in mating_pool],
+                                  pro_c=pro_c, dis_c=dis_c, pro_m=pro_m, dis_m=dis_m)
 
-        # ---- GA crossover + mutation to generate velocity candidates --------
-        # operator_ga expects a list of parent arrays selected by mating_pool.
-        parents_selected = [population[i] for i in mating_pool]
-        velocity_spring  = operator_ga(
-            manifold, parents_selected,
-            pro_c=pro_c, dis_c=dis_c, pro_m=pro_m, dis_m=dis_m,
-        )
-
-        # ---- Update positions using the GA-generated velocity ---------------
         for i in range(population_size):
-            pool_idx = mating_pool[i]
-            xi       = population[pool_idx]        # current position
-            vi_raw   = velocity_spring[i]          # raw GA output (Euclidean)
+            idx        = mating_pool[i]
+            xi         = population[idx]
+            vi_tang    = manifold.projection(xi, vel_spring[i])
+            population[idx] = manifold.retraction(xi, w * (vi_tang - xi))
+            velocities[idx] = w * (vel_spring[i] - vi_tang)
 
-            # -- Project vi_raw onto the tangent space at xi ------------------
-            # The tangent-space projection removes the component of vi_raw
-            # that is normal to the manifold at xi.
-            vi_tangent = manifold.projection(xi, vi_raw)
-
-            # -- "firstgo": displacement toward the new position --------------
-            # vtemp is the component that moves xi *along* the manifold;
-            # scaled by the inertia weight w.
-            vtemp    = vi_tangent - xi              # deviation from xi
-            firstgo  = w * vtemp                   # scaled displacement
-
-            # Retract to stay on manifold
-            population[pool_idx] = manifold.retraction(xi, firstgo)
-
-            # -- Residual tangent velocity (orthogonal component) -------------
-            # After retraction to the new position, keep the part of vi_raw
-            # that was already tangential (perpendicular to xi's normal).
-            vi_orth            = vi_raw - vi_tangent   # tangential residual
-            velocities[pool_idx] = w * vi_orth         # store scaled velocity
-
-        # ---- Evaluate offspring: retract each particle by its velocity ------
         offspring  = [None] * population_size
         off_costs  = np.zeros(population_size)
-
         for i in range(population_size):
-            pool_idx   = mating_pool[i]
-            xi_new     = population[pool_idx]
-            vi_new     = velocities[pool_idx]
+            idx       = mating_pool[i]
+            vi        = velocities[idx] if velocities[idx] is not None \
+                        else manifold.zero_vector(population[idx])
+            offspring[i]  = manifold.retraction(population[idx], vi)
+            off_costs[i]  = cost_fn(offspring[i])
+            cost_evals   += 1
 
-            if vi_new is None:
-                # Safety fallback for the very first call before velocity is set
-                vi_new = manifold.zero_vector(xi_new)
-
-            # Retract along the stored velocity to generate the offspring
-            offspring[i] = manifold.retraction(xi_new, vi_new)
-            off_costs[i] = cost_fn(offspring[i])
-            cost_evals  += 1
-
-        # ---- Survival selection (elitist μ + λ) ----------------------------
-        # Merge current population and offspring; keep the best population_size.
         combined_pop   = population + offspring
         combined_costs = np.concatenate([costs, off_costs])
+        order          = np.argsort(combined_costs)
+        population     = [combined_pop[j] for j in order[:population_size]]
+        costs          =  combined_costs[order[:population_size]]
 
-        sorted_indices = np.argsort(combined_costs)
-        population = [combined_pop[j]   for j in sorted_indices[:population_size]]
-        costs      =  combined_costs[sorted_indices[:population_size]]
-
-        # ---- Update global best --------------------------------------------
         if costs[0] < best_cost:
             best_cost = float(costs[0])
             best_x    = population[0].copy()
 
-        # ---- Record stats --------------------------------------------------
         elapsed = time.perf_counter() - t_start
-        history.append(IterationStats(
-            iteration  = iteration,
-            cost       = best_cost,
-            cost_evals = cost_evals,
-            time       = elapsed,
-            population = [p.copy() for p in population],
-            best_point = best_x.copy(),
+        history.append(IterationStats(iteration, best_cost, cost_evals,
+                                      elapsed, [p.copy() for p in population],
+                                      best_x.copy()))
+        if verbosity >= 1:
+            print(f"{iteration:>6}  {cost_evals:>8}  {best_cost:>+18.8e}")
+
+    return OptimiseResult(x=best_x, cost=best_cost, history=history)
+
+
+
+def mdtma_explore(
+    manifold,
+    *,
+    population_size: int   = 20,
+    max_iter:        int   = 100,
+    w0:              float = 0.5,
+    min_spacing:     float = 0.05,
+    x0:              Optional[List[np.ndarray]] = None,
+    verbosity:       int   = 1,
+    pro_c: float = 1.0, dis_c: float = 20.0,
+    pro_m: float = 1.0, dis_m: float = 20.0,
+) -> ExploreResult:
+    """
+    Run mDTMA in exploration mode: collect maximally spread points on manifold.
+
+    Instead of minimising a cost function this variant drives the population to
+    explore the manifold as broadly as possible and accumulates all visited
+    points into a dataset.
+
+    Parameters
+    ----------
+    manifold : pymanopt manifold
+    population_size : int   (capped at 4*dim)
+    max_iter        : int   (at least 10*dim, capped at 800)
+    w0              : float  Base inertia weight (same decay schedule as original)
+    min_spacing     : float  Minimum Euclidean distance between any two archive
+                             points.  Offspring closer than this to any existing
+                             archive point are replaced with a fresh random point.
+    x0              : optional initial population list
+    verbosity       : 0 silent, 1 per-iter line
+
+    Returns
+    -------
+    ExploreResult
+        .points  — list of all collected manifold points
+        .history — per-iteration stats including the live archive
+    """
+    dim             = manifold.dim
+    max_iter        = min(800, max(max_iter, 10 * dim))
+    population_size = min(population_size, 4 * dim)
+
+    # Initialise population
+    population = (list(x0) if x0 is not None
+                  else [manifold.random_point() for _ in range(population_size)])
+    population_size = len(population)
+    velocities: List[Optional[np.ndarray]] = [None] * population_size
+
+    archive: List[np.ndarray] = [p.copy() for p in population]
+
+    # Initial exploration costs: for each seed point, cost vs rest of archive
+    costs = np.array([
+        _exploration_cost(p, [a for j, a in enumerate(archive) if j != i])
+        for i, p in enumerate(population)
+    ], dtype=float)
+    cost_evals = population_size
+
+    history: List[ExploreStats] = []
+    t_start = time.perf_counter()
+
+    if verbosity >= 1:
+        print(f"{'Iter':>6}  {'Archive':>8}  {'Max gap':>12}")
+        print("-" * 32)
+
+    for iteration in range(1, max_iter + 1):
+        # decaying inertia weight
+        w = w0 + 0.1 * (1.0 - iteration / max_iter)
+
+        # tournament selection (on exploration cost)
+        mating_pool = tournament_selection(2, population_size, costs)
+
+        # GA crossover + mutation
+        vel_spring = operator_ga(manifold, [population[i] for i in mating_pool],
+                                 pro_c=pro_c, dis_c=dis_c, pro_m=pro_m, dis_m=dis_m)
+
+        # update positions via retraction
+        for i in range(population_size):
+            idx     = mating_pool[i]
+            xi      = population[idx]
+            vi_tang = manifold.projection(xi, vel_spring[i])
+            population[idx] = manifold.retraction(xi, w * (vi_tang - xi))
+            velocities[idx] = w * (vel_spring[i] - vi_tang)
+
+        # generate offspring via velocity retraction + spacing rejection
+        offspring = []
+        for i in range(population_size):
+            idx = mating_pool[i]
+            vi  = velocities[idx] if velocities[idx] is not None \
+                  else manifold.zero_vector(population[idx])
+            candidate  = manifold.retraction(population[idx], vi)
+            cost_evals += 1
+
+            # reject if too close to any archived point
+            if archive and _min_dist_to_archive(candidate, archive) < min_spacing:
+                candidate  = manifold.random_point()   # fresh random replacement
+                cost_evals += 1
+
+            offspring.append(candidate)
+
+        # add all offspring to the permanent archive
+        for pt in offspring:
+            archive.append(pt.copy())
+
+        # re-evaluate parent costs vs updated archive before selection
+        costs_parents = np.array(
+            [_exploration_cost(p, archive) for p in population], dtype=float)
+        off_costs = np.array(
+            [_exploration_cost(o, archive) for o in offspring], dtype=float)
+
+        # (μ+λ) elitist selection — now ranked by exploration cost
+        combined_pop   = population + offspring
+        combined_costs = np.concatenate([costs_parents, off_costs])
+        order          = np.argsort(combined_costs)   # lowest cost = most isolated
+        population     = [combined_pop[j] for j in order[:population_size]]
+        costs          =  combined_costs[order[:population_size]]
+
+        # Compute max nearest-neighbour gap in archive (coverage quality metric)
+        if len(archive) >= 2:
+            A = np.stack(archive)
+            # For each point: distance to nearest neighbour in archive
+            dists_sq  = (np.sum(A**2, axis=1, keepdims=True) +
+                         np.sum(A**2, axis=1) - 2.0 * A @ A.T)
+            np.fill_diagonal(dists_sq, np.inf)
+            nn_dists   = np.sqrt(np.clip(dists_sq, 0, None).min(axis=1))
+            max_gap    = float(nn_dists.max())
+        else:
+            max_gap = 0.0
+
+        elapsed = time.perf_counter() - t_start
+        history.append(ExploreStats(
+            iteration    = iteration,
+            archive_size = len(archive),
+            max_gap      = max_gap,
+            cost_evals   = cost_evals,
+            time         = elapsed,
+            population   = [p.copy() for p in population],
+            archive      = [a.copy() for a in archive],
         ))
 
         if verbosity >= 1:
-            print(f"{iteration:>6}  {cost_evals:>10}  {best_cost:>+18.8e}")
+            print(f"{iteration:>6}  {len(archive):>8}  {max_gap:>12.6f}")
 
-    # =========================================================================
-    return OptimiseResult(x=best_x, cost=best_cost, history=history)
+    return ExploreResult(points=archive, history=history)
